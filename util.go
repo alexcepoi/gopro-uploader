@@ -5,6 +5,7 @@ import (
 	"os/exec"
 )
 
+// Verifies if dependencies are installed and fails otherwise.
 func checkDependencies(commands ...string) {
 	for _, dep := range commands {
 		if _, err := exec.LookPath(dep); err != nil {
@@ -13,6 +14,7 @@ func checkDependencies(commands ...string) {
 	}
 }
 
+// Verifies if an element is present in a list.
 func contains(list []string, elem string) bool {
 	for _, i := range list {
 		if i == elem {

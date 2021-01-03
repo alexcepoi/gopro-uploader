@@ -14,10 +14,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
-
-	"golang.org/x/net/context"
-	"google.golang.org/api/youtube/v3"
 )
 
 const VideoExt = ".mp4"
@@ -42,6 +40,23 @@ type Video struct {
 	Chapters []Chapter
 }
 
+// Returns the list of videos present in directory.
+func listRenderedVideos(dirPath string) ([]string, error) {
+	files, err := ioutil.ReadDir(dirPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var results []string
+	for _, file := range files {
+		if strings.HasSuffix(strings.ToLower(file.Name()), VideoExt) {
+			results = append(results, strings.TrimSuffix(file.Name(), VideoExt))
+		}
+	}
+	return results, nil
+}
+
+// Parses a string like 60/1 or 15360/256 to determine actual frame rate.
 func parseFrameRate(spec string) (float64, error) {
 	parts := strings.Split(spec, "/")
 	if len(parts) != 2 {
@@ -58,8 +73,10 @@ func parseFrameRate(spec string) (float64, error) {
 	return float64(x) / float64(y), nil
 }
 
+// Creates a chapter object from file metadata.
 func fetchChapter(dirPath, fileName string) (*Chapter, error) {
-	cmd := exec.Command("ffprobe", "-v", "error", path.Join(dirPath, fileName), "-print_format", "json", "-show_format", "-show_streams")
+	cmd := exec.Command("ffprobe", "-v", "error", path.Join(dirPath, fileName),
+		"-print_format", "json", "-show_format", "-show_streams")
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = os.Stderr
@@ -97,14 +114,21 @@ func fetchChapter(dirPath, fileName string) (*Chapter, error) {
 		return nil, err
 	}
 
-	return &Chapter{FileName: fileName, Duration: duration, CreateTime: createTime, Resolution: VideoResolution{
-		Width:     data.Streams[0].Coded_width,
-		Height:    data.Streams[0].Coded_height,
-		Codec:     data.Streams[0].Codec_name,
-		FrameRate: frame_rate,
-	}}, nil
+	return &Chapter{
+		FileName:   fileName,
+		Duration:   duration,
+		CreateTime: createTime,
+		Resolution: VideoResolution{
+			Width:     data.Streams[0].Coded_width,
+			Height:    data.Streams[0].Coded_height,
+			Codec:     data.Streams[0].Codec_name,
+			FrameRate: frame_rate,
+		}}, nil
 }
 
+// Returns all chapters from a directory (non-recursive).
+// TODO(alexcepoi): Add support for timelapses.
+// ffmpeg -framerate 60 -pattern_type glob -i '*.JPG' output.mp4
 func getChapters(dirPath string) ([]Chapter, error) {
 	files, err := ioutil.ReadDir(dirPath)
 	if err != nil {
@@ -113,7 +137,9 @@ func getChapters(dirPath string) ([]Chapter, error) {
 
 	var results []Chapter
 	for _, file := range files {
-		if !file.IsDir() && strings.HasSuffix(strings.ToLower(file.Name()), VideoExt) && !strings.HasPrefix(file.Name(), ".") {
+		if !file.IsDir() &&
+			strings.HasSuffix(strings.ToLower(file.Name()), VideoExt) &&
+			!strings.HasPrefix(file.Name(), ".") {
 			chapter, err := fetchChapter(dirPath, file.Name())
 			if err != nil {
 				return nil, err
@@ -127,6 +153,7 @@ func getChapters(dirPath string) ([]Chapter, error) {
 	return results, nil
 }
 
+// Verify if two chapters are compatible with ffmpeg concat demuxer.
 func canUseConcatDemuxer(x, y Chapter) bool {
 	if x.Resolution.Width != y.Resolution.Width {
 		return false
@@ -140,6 +167,8 @@ func canUseConcatDemuxer(x, y Chapter) bool {
 	return true
 }
 
+// Splits a video into multiple ones so that ffmpeg concat demuxer can be aplied
+// to all chapters in each video.
 func splitVideo(video Video) []Video {
 	var chapter_batches [][]Chapter
 	for ix, chapter := range video.Chapters {
@@ -165,6 +194,7 @@ func splitVideo(video Video) []Video {
 	return results
 }
 
+// Generates a title for the video based on path.
 func generateVideoTitle(dirPath, rootPath, prefix string) string {
 	var parts []string
 	var part string
@@ -180,77 +210,123 @@ func generateVideoTitle(dirPath, rootPath, prefix string) string {
 	return fmt.Sprintf("[%s] %s", prefix, strings.Join(parts, " # "))
 }
 
-func generateChapterDescriptions(chapters []Chapter) []string {
+// Generates a description for the video based on its chapters.
+func generateVideoDescription(chapters []Chapter) string {
 	var lines []string
 	var startTime time.Duration
 	for _, chapter := range chapters {
-		lines = append(lines, fmt.Sprintf("%s | %s [%dx%d @ %06.2f ~ %s]", fmtDuration(startTime), chapter.FileName, chapter.Resolution.Width, chapter.Resolution.Height, chapter.Resolution.FrameRate, chapter.CreateTime.Format(time.RFC1123)))
+		lines = append(lines,
+			fmt.Sprintf("%s | %s [%dx%d @ %06.2f ~ %s]",
+				fmtDurationForYouTube(startTime),
+				chapter.FileName,
+				chapter.Resolution.Width,
+				chapter.Resolution.Height,
+				chapter.Resolution.FrameRate,
+				chapter.CreateTime.Format(time.RFC1123)))
 		startTime += chapter.Duration
 	}
-	return lines
+	return strings.Join(lines, "\n")
 }
 
-func uploadVideo(video Video, uploadFn func(path string) error) error {
-	dir, err := ioutil.TempDir("", "gopro-uploader")
+// Write metadata file including chapter information.
+func writeMetadata(video Video, outputFile string) error {
+	chapterStartTimeMs := func(i int, chapters []Chapter) int64 {
+		start := int64(0)
+		for _, chapter := range chapters[:i] {
+			start += chapter.Duration.Milliseconds()
+		}
+		return start
+	}
+	chapterEndTimeMs := func(i int, chapters []Chapter) int64 {
+		return chapterStartTimeMs(i, chapters) + chapters[i].Duration.Milliseconds()
+	}
+
+	var tmpl = template.Must(template.New("metadata").Funcs(template.FuncMap{
+		"startTimeMs": chapterStartTimeMs,
+		"endTimeMs":   chapterEndTimeMs,
+	}).Parse(`;FFMETADATA1
+title={{.Title}}
+{{ range $i, $ch := .Chapters }}
+[CHAPTER]
+TIMEBASE=1/1000
+START={{ startTimeMs $i $.Chapters }}
+END={{ endTimeMs $i $.Chapters  }}
+title={{ $ch.FileName }}
+{{ end  }}`))
+	f, err := os.Create(outputFile)
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(dir)
+	return tmpl.Execute(f, video)
+}
+
+// Renders a video concatenating its chapters.
+func renderVideo(video Video, outputDir string) error {
+	tmpDir, err := ioutil.TempDir("", "gopro-uploader")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
 
 	var inputLines []string
 	for _, chapter := range video.Chapters {
-		inputLines = append(inputLines, fmt.Sprintf("file '%s'", path.Join(video.Path, chapter.FileName)))
+		inputLines = append(inputLines,
+			fmt.Sprintf("file '%s'", path.Join(video.Path, chapter.FileName)))
 	}
 
-	inputFname := filepath.Join(dir, "input.txt")
-	if err := ioutil.WriteFile(inputFname, []byte(strings.Join(inputLines, "\n")), 0644); err != nil {
+	inputFname := filepath.Join(tmpDir, "input.txt")
+	if err := ioutil.WriteFile(
+		inputFname, []byte(strings.Join(inputLines, "\n")), os.ModePerm); err != nil {
 		return err
 	}
-	outputFname := filepath.Join(dir, "output"+VideoExt)
-	log.Printf(">>> Rendering %s", outputFname)
-	cmd := exec.Command("ffmpeg", "-v", "warning", "-f", "concat", "-safe", "0", "-i", inputFname, "-c", "copy", outputFname, "-y", "-stats")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err = cmd.Run()
+	metadataFname := filepath.Join(tmpDir, "chapters.txt")
+	err = writeMetadata(video, metadataFname)
 	if err != nil {
 		return err
 	}
-	return uploadFn(outputFname)
+	outputFname := filepath.Join(outputDir, video.Title+VideoExt)
+	log.Printf(">>> Rendering %s", outputFname)
+	cmd := exec.Command("ffmpeg", "-v", "warning",
+		"-f", "concat", "-safe", "0",
+		"-i", inputFname,
+		"-i", metadataFname,
+		"-map_metadata", "1",
+		"-c", "copy", outputFname,
+		"-y", "-stats")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func main() {
 	checkDependencies("ffprobe", "ffmpeg")
 
-	dir := flag.String("dir", "", "Directory to traverse for video files.")
+	inputDir := flag.String("input_dir", "", "Directory to traverse for video files.")
+	outputDir := flag.String("output_dir", "", "Directory in which to output rendered video files.")
 	prefix := flag.String("prefix", "", "Prefix to use in all video titles.")
-	playlistId := flag.String("playlist_id", "", "Playlist to put videos in.")
-	dryRun := flag.Bool("dry_run", false, "If true, does not attempt to upload videos.")
+	dryRun := flag.Bool("dry_run", false, "If true, does not attempt to render videos.")
 	flag.Parse()
-	if *dir == "" {
-		log.Fatalf("--dir cannot be empty")
+	if *inputDir == "" {
+		log.Fatalf("--inputDir cannot be empty")
+	}
+	if *outputDir == "" {
+		log.Fatalf("--outputDir cannot be empty")
 	}
 	if *prefix == "" {
 		log.Fatalf("--prefix cannot be empty")
 	}
-	if *playlistId == "" {
-		log.Fatalf("--playlist_id cannot be empty")
-	}
 
-	ctx := context.Background()
-	client_opts, err := newGoogleOAuth2Client(ctx, youtube.YoutubeScope)
-	if err != nil {
+	err := os.Mkdir(*outputDir, os.ModePerm)
+	if err != nil && !os.IsExist(err) {
 		log.Fatal(err)
 	}
-	service, err := youtube.NewService(ctx, client_opts)
-	if err != nil {
-		log.Fatalf("Error creating YouTube client: %v", err)
-	}
-	titles, err := listVideoTitlesInPlaylist(service, *playlistId)
+
+	titles, err := listRenderedVideos(*outputDir)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	err = filepath.Walk(*dir, func(dirPath string, info os.FileInfo, err error) error {
+	err = filepath.Walk(*inputDir, func(dirPath string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -266,41 +342,17 @@ func main() {
 			return nil
 		}
 
-		videoTitle := generateVideoTitle(dirPath, *dir, *prefix)
+		videoTitle := generateVideoTitle(dirPath, *inputDir, *prefix)
 		for _, video := range splitVideo(Video{Title: videoTitle, Path: dirPath, Chapters: chapters}) {
-			chapterDescriptions := generateChapterDescriptions(video.Chapters)
-			log.Printf("> %s", video.Title)
-			for _, chapterDesc := range chapterDescriptions {
-				log.Printf("*** %s", chapterDesc)
-			}
+			log.Printf("=== %s\n%v", video.Title, generateVideoDescription(video.Chapters))
 			if contains(titles, video.Title) {
-				log.Printf(">>> Already uploaded.. skipping..")
+				log.Printf(">>> Already rendered.. skipping..")
 				continue
 			}
 			if *dryRun {
 				continue
 			}
-			err := uploadVideo(
-				video,
-				func(path string) error {
-					log.Printf(">>> Uploading from %v", path)
-					id, err := uploadVideoToYoutube(service, YoutubeVideo{
-						Title:         video.Title,
-						Description:   strings.Join(chapterDescriptions, "\n"),
-						CategoryId:    "17",
-						PrivacyStatus: "unlisted",
-						Path:          path,
-						CreateTime:    video.Chapters[0].CreateTime,
-					})
-					if err != nil {
-						return err
-					}
-					log.Printf(">>> Upload successful: https://youtu.be/%s", id)
-					return addVideoToPlaylist(service, *playlistId, id)
-				})
-			if err != nil {
-				return err
-			}
+			return renderVideo(video, *outputDir)
 		}
 		return nil
 	})
