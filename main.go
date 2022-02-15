@@ -352,7 +352,10 @@ func main() {
 			if *dryRun {
 				continue
 			}
-			return renderVideo(video, *outputDir)
+			err = renderVideo(video, *outputDir)
+			if err != nil {
+				return err
+			}
 		}
 		return nil
 	})
