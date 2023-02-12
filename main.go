@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,9 @@ import (
 )
 
 const VideoExt = ".mp4"
+
+// https://community.gopro.com/s/article/GoPro-Camera-File-Naming-Convention
+var goproFnameRegex = regexp.MustCompile(`G[HX](\d{2})(\d{4})\.MP4`)
 
 type VideoResolution struct {
 	Width     int
@@ -126,6 +130,29 @@ func fetchChapter(dirPath, fileName string) (*Chapter, error) {
 		}}, nil
 }
 
+// Determines which chapter was chronologically recorded first.
+// GoPro cameras may reset the date in case of battery swap, so prefer sorting
+// by filename if possible, and fallback to create time.
+func compareChapters(a, b Chapter) bool {
+	aMatch := goproFnameRegex.FindStringSubmatch(a.FileName)
+	bMatch := goproFnameRegex.FindStringSubmatch(b.FileName)
+	if len(aMatch) == 3 && len(bMatch) == 3 {
+		if aMatch[2] < bMatch[2] {
+			return true
+		}
+		if aMatch[2] > bMatch[2] {
+			return false
+		}
+		if aMatch[1] < bMatch[1] {
+			return true
+		}
+		if aMatch[1] > bMatch[1] {
+			return false
+		}
+	}
+	return a.CreateTime.Before(b.CreateTime)
+}
+
 // Returns all chapters from a directory (non-recursive).
 // TODO(alexcepoi): Add support for timelapses.
 // ffmpeg -framerate 60 -pattern_type glob -i '*.JPG' output.mp4
@@ -148,7 +175,7 @@ func getChapters(dirPath string) ([]Chapter, error) {
 		}
 	}
 	sort.Slice(results, func(i, j int) bool {
-		return results[i].CreateTime.Before(results[j].CreateTime)
+		return compareChapters(results[i], results[j])
 	})
 	return results, nil
 }
